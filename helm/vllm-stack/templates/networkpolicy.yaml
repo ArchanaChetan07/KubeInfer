@@ -1,0 +1,136 @@
+# helm/vllm-stack/templates/networkpolicy.yaml
+# Zero-trust network policy for the inference namespace.
+# Default: deny all ingress and egress, then selectively allow.
+{{- if .Values.networkPolicy.enabled }}
+---
+# DENY ALL — baseline deny for every pod in the namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  podSelector: {}   # Applies to ALL pods in namespace
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# ALLOW: engine pods receive traffic ONLY from the router and Prometheus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-router-to-engine
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: engine
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from the router (same namespace)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: router
+      ports:
+        - port: 8000
+    # Allow from Prometheus scraper (monitoring namespace)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 8000
+    {{- range .Values.networkPolicy.additionalIngressNamespaces }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+      ports:
+        - port: 8000
+    {{- end }}
+
+---
+# ALLOW: router receives external traffic (from LoadBalancer / Ingress)
+# and forwards to engines.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-router
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: router
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Accept from anywhere (LoadBalancer, Ingress controller, direct clients)
+    - ports:
+        - port: 8000
+  egress:
+    # Forward to engine pods in same namespace
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: engine
+      ports:
+        - port: 8000
+
+---
+# ALLOW: all pods can egress to kube-dns (required for DNS resolution).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+---
+# ALLOW: engine pods can egress to HuggingFace Hub (model download at startup).
+# Lock this down in air-gapped environments — set up a private model registry instead.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-engine-egress-huggingface
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: engine
+  policyTypes:
+    - Egress
+  egress:
+    # HuggingFace Hub (443) — model download
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 80
+          protocol: TCP
+{{- end }}

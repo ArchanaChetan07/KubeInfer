@@ -1,0 +1,158 @@
+# tests/helm-unit-tests/deployment_test.yaml
+# Helm unittest tests. Run with: helm unittest helm/vllm-stack/
+# Install plugin: helm plugin install https://github.com/helm-unittest/helm-unittest
+
+suite: "vLLM Deployment Tests"
+
+templates:
+  - templates/deployment.yaml
+
+tests:
+  - it: "should render engine deployment with correct image"
+    set:
+      engine.image.repository: vllm/vllm-openai
+      engine.image.tag: v0.6.6
+    asserts:
+      - isKind:
+          of: Deployment
+      - matchRegex:
+          path: metadata.name
+          pattern: ".*-engine"
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "vllm/vllm-openai:v0.6.6"
+
+  - it: "should allocate correct number of GPUs"
+    set:
+      engine.gpuCount: 2
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits["nvidia.com/gpu"]
+          value: "2"
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests["nvidia.com/gpu"]
+          value: "2"
+
+  - it: "should mount model cache PVC when enabled"
+    set:
+      modelCache.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: model-cache
+            persistentVolumeClaim:
+              claimName: RELEASE-NAME-vllm-stack-model-cache
+
+  - it: "should use emptyDir when model cache disabled"
+    set:
+      modelCache.enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: model-cache
+            emptyDir: {}
+
+  - it: "should not automount service account token on engine"
+    asserts:
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+
+  - it: "should include env vars from extraEnv"
+    set:
+      engine.extraEnv:
+        - name: MY_VAR
+          value: "my-value"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MY_VAR
+            value: "my-value"
+
+---
+suite: "HPA Tests"
+
+templates:
+  - templates/hpa.yaml
+
+tests:
+  - it: "should render HPA when enabled"
+    set:
+      hpa.enabled: true
+      hpa.minReplicas: 2
+      hpa.maxReplicas: 8
+    asserts:
+      - isKind:
+          of: HorizontalPodAutoscaler
+      - equal:
+          path: spec.minReplicas
+          value: 2
+      - equal:
+          path: spec.maxReplicas
+          value: 8
+
+  - it: "should not render HPA when disabled"
+    set:
+      hpa.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 1   # Only the PDB should render
+          # (PDB is in same template file)
+
+  - it: "should scale on queue depth metric"
+    set:
+      hpa.enabled: true
+      hpa.queueDepthThreshold: "5"
+    asserts:
+      - equal:
+          path: spec.metrics[0].type
+          value: Pods
+      - equal:
+          path: spec.metrics[0].pods.metric.name
+          value: vllm_num_requests_waiting
+
+---
+suite: "RBAC Tests"
+
+templates:
+  - templates/rbac.yaml
+
+tests:
+  - it: "should create ServiceAccount for engine"
+    set:
+      rbac.create: true
+    asserts:
+      - isKind:
+          of: ServiceAccount
+      - equal:
+          path: automountServiceAccountToken
+          value: false
+
+  - it: "should not create RBAC when disabled"
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+---
+suite: "PDB Tests"
+
+templates:
+  - templates/hpa.yaml
+
+tests:
+  - it: "should render PDB when enabled"
+    set:
+      pdb.enabled: true
+      pdb.minAvailable: 1
+      hpa.enabled: false
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: spec.minAvailable
+          value: 1

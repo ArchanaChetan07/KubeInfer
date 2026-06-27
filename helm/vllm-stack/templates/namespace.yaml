@@ -1,0 +1,15 @@
+# helm/vllm-stack/templates/namespace.yaml
+# Dedicated namespace for all inference workloads.
+# Keeps GPU quota, RBAC, and NetworkPolicy isolated from other teams.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+    # Pod Security Standards enforcement.
+    # "baseline" is the right level for GPU workloads — restricted blocks host device access.
+    pod-security.kubernetes.io/enforce: {{ .Values.namespace.podSecurityStandard }}
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: {{ .Values.namespace.podSecurityStandard }}
+    pod-security.kubernetes.io/warn-version: latest

@@ -1,0 +1,164 @@
+# .github/workflows/ci.yaml
+# Runs on every PR and push to main.
+# Gates: helm lint → helm unittest → trivy image scan → kubeconform YAML validation
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main, release/**]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint: validate Helm chart syntax and template rendering
+  # ---------------------------------------------------------------------------
+  helm-lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.0"
+
+      - name: Add dependency repos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Build chart dependencies
+        run: helm dependency build helm/vllm-stack/
+
+      - name: Lint (default values)
+        run: helm lint helm/vllm-stack/
+
+      - name: Lint (dev values)
+        run: helm lint helm/vllm-stack/ -f environments/dev/values.yaml
+
+      - name: Lint (staging values)
+        run: helm lint helm/vllm-stack/ -f environments/staging/values.yaml
+
+      - name: Lint (prod values)
+        run: helm lint helm/vllm-stack/ -f environments/prod/values.yaml
+
+  # ---------------------------------------------------------------------------
+  # Unit tests: verify template rendering with helm-unittest
+  # ---------------------------------------------------------------------------
+  helm-unittest:
+    name: Helm Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.0"
+
+      - name: Install helm-unittest plugin
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest
+
+      - name: Add dependency repos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Build chart dependencies
+        run: helm dependency build helm/vllm-stack/
+
+      - name: Run unit tests
+        run: helm unittest helm/vllm-stack/ --file tests/helm-unit-tests/*.yaml
+
+  # ---------------------------------------------------------------------------
+  # YAML validation: ensure rendered manifests conform to K8s API schemas
+  # ---------------------------------------------------------------------------
+  kubeconform:
+    name: Kubeconform Validation
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, staging, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.0"
+
+      - name: Install kubeconform
+        run: |
+          wget -q https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform-linux-amd64.tar.gz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Add dependency repos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Build chart dependencies
+        run: helm dependency build helm/vllm-stack/
+
+      - name: Render + validate (${{ matrix.env }})
+        run: |
+          helm template vllm-stack helm/vllm-stack/ \
+            -f environments/${{ matrix.env }}/values.yaml \
+            --namespace llm-inference \
+          | kubeconform \
+            -kubernetes-version 1.29.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            -ignore-missing-schemas \
+            -summary \
+            -verbose
+
+  # ---------------------------------------------------------------------------
+  # Security: scan vLLM container image with Trivy
+  # ---------------------------------------------------------------------------
+  trivy-scan:
+    name: Trivy Image Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "vllm/vllm-openai:latest"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          # Fail on HIGH and CRITICAL CVEs with a fix available
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+          ignore-unfixed: true
+
+      - name: Upload results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  # ---------------------------------------------------------------------------
+  # Secret scanning: ensure no secrets are committed to the repo
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

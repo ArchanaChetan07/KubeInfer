@@ -1,0 +1,107 @@
+# helm/vllm-stack/templates/hpa.yaml
+# =============================================================================
+# HorizontalPodAutoscaler — scales on inference queue depth, not CPU.
+#
+# WHY NOT CPU?
+#   LLM inference is GPU-bound. The CPU can sit at 5% while the GPU is saturated
+#   and the request queue has 50 waiting requests. CPU-based HPA gives you nothing.
+#
+# WHY QUEUE DEPTH?
+#   vllm:num_requests_waiting is the number of requests sitting in the scheduler
+#   queue waiting for a batch slot. When this grows, users are waiting. When it's
+#   zero, the engine has spare capacity. It's the most direct scaling signal.
+#
+# ASYMMETRIC BEHAVIOR:
+#   Scale up fast (traffic spikes are real, GPU pods take 2–5 min to become ready).
+#   Scale down slow (avoid churning expensive GPU nodes under transient dips).
+# =============================================================================
+{{- if .Values.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-engine
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "vllm-stack.fullname" . }}-engine
+  minReplicas: {{ .Values.hpa.minReplicas }}
+  maxReplicas: {{ .Values.hpa.maxReplicas }}
+  metrics:
+    # Primary signal: inference queue depth (custom metric via Prometheus Adapter).
+    - type: Pods
+      pods:
+        metric:
+          name: vllm_num_requests_waiting
+        target:
+          type: AverageValue
+          # Scale up when average queue depth per engine replica > 5.
+          # Lower this for latency-sensitive workloads.
+          averageValue: {{ .Values.hpa.queueDepthThreshold | quote }}
+  behavior:
+    scaleUp:
+      # Don't wait long — GPU pods take minutes, start new ones immediately.
+      stabilizationWindowSeconds: {{ .Values.hpa.behavior.scaleUp.stabilizationWindowSeconds }}
+      policies:
+        {{- toYaml .Values.hpa.behavior.scaleUp.policies | nindent 8 }}
+    scaleDown:
+      # 10 minutes of sustained low queue before removing a replica.
+      # Prevents GPU node churn on transient traffic dips.
+      stabilizationWindowSeconds: {{ .Values.hpa.behavior.scaleDown.stabilizationWindowSeconds }}
+      policies:
+        {{- toYaml .Values.hpa.behavior.scaleDown.policies | nindent 8 }}
+{{- end }}
+
+{{- if and .Values.router.enabled .Values.router.autoscaling.enabled }}
+---
+# Router HPA — CPU-based (router is stateless and CPU-bound, unlike the engine).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-router
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "vllm-stack.fullname" . }}-router
+  minReplicas: {{ .Values.router.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.router.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.router.autoscaling.targetCPUUtilization }}
+{{- end }}
+
+---
+# =============================================================================
+# PodDisruptionBudget — ensures availability during node drains and upgrades.
+#
+# With minAvailable: 1, Kubernetes will refuse to evict the last running engine
+# pod during a node drain. This prevents downtime during cluster maintenance.
+#
+# In production with replicaCount >= 3, set minAvailable: 2.
+# =============================================================================
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-engine
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "vllm-stack.engineSelectorLabels" . | nindent 6 }}
+{{- end }}

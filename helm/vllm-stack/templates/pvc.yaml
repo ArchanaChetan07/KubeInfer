@@ -1,0 +1,51 @@
+# helm/vllm-stack/templates/pvc.yaml
+{{- if .Values.modelCache.enabled }}
+---
+# Model weight cache PVC.
+# ReadWriteMany allows all engine replicas to mount the same volume,
+# so HPA scale-out does not trigger a model re-download (which can take 10+ minutes
+# for large models). Requires a shared StorageClass (NFS, EFS, CephFS, etc.)
+# on multi-node clusters.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-model-cache
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+  annotations:
+    # Retain the PVC on Helm uninstall — models are expensive to re-download.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.modelCache.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.modelCache.size }}
+  {{- if .Values.modelCache.storageClass }}
+  storageClassName: {{ .Values.modelCache.storageClass }}
+  {{- end }}
+{{- end }}
+
+{{- if .Values.openWebui.enabled }}
+---
+# Open WebUI data PVC — stores user accounts and chat history.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-webui-data
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.openWebui.storage.size }}
+  {{- if .Values.openWebui.storage.storageClass }}
+  storageClassName: {{ .Values.openWebui.storage.storageClass }}
+  {{- end }}
+{{- end }}

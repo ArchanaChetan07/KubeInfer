@@ -1,0 +1,197 @@
+# monitoring/alerts/vllm-alerts.yaml
+# PrometheusRule CRD — requires Prometheus Operator (kube-prometheus-stack).
+# Covers the alerts that actually matter for an LLM inference startup.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: vllm-inference-alerts
+  namespace: monitoring
+  labels:
+    release: prometheus    # Must match Prometheus Operator's ruleSelector
+    app: vllm-stack
+spec:
+  groups:
+
+    # =========================================================================
+    # Availability alerts — page immediately
+    # =========================================================================
+    - name: vllm.availability
+      rules:
+        - alert: VLLMEngineDown
+          # No engine pod has been ready for > 2 minutes.
+          expr: |
+            count(kube_pod_container_status_ready{namespace="llm-inference", container="vllm-engine"} == 1) == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "All vLLM engine pods are down"
+            description: "No vLLM engine pod has been ready for 2+ minutes. Users cannot make inference requests. Check pod status: kubectl get pods -n llm-inference"
+            runbook: "https://github.com/yourorg/llm-inference-platform/blob/main/docs/runbook.md#engine-down"
+
+        - alert: VLLMEngineRestartLoop
+          # Engine restarted more than 3 times in 15 minutes.
+          expr: |
+            rate(kube_pod_container_status_restarts_total{namespace="llm-inference", container="vllm-engine"}[15m]) > 0.2
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "vLLM engine is crash-looping"
+            description: "Engine pod {{ $labels.pod }} has restarted more than 3 times in 15 minutes. Likely an OOM kill or model loading error. Check logs: kubectl logs {{ $labels.pod }} -n llm-inference"
+            runbook: "https://github.com/yourorg/llm-inference-platform/blob/main/docs/runbook.md#crash-loop"
+
+    # =========================================================================
+    # Latency alerts — page during business hours
+    # =========================================================================
+    - name: vllm.latency
+      rules:
+        - alert: VLLMHighTimeToFirstToken
+          # P95 time-to-first-token > 10 seconds for 5 minutes.
+          expr: |
+            histogram_quantile(0.95,
+              rate(vllm:time_to_first_token_seconds_bucket[5m])
+            ) > 10
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "vLLM P95 time-to-first-token > 10s"
+            description: "P95 TTFT is {{ $value | humanizeDuration }}. Users are waiting a long time for responses to begin. Check queue depth and GPU utilization."
+
+        - alert: VLLMHighE2ELatency
+          # P95 end-to-end request latency > 60 seconds.
+          expr: |
+            histogram_quantile(0.95,
+              rate(vllm:e2e_request_latency_seconds_bucket[5m])
+            ) > 60
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "vLLM P95 end-to-end latency > 60s"
+            description: "P95 e2e latency is {{ $value | humanizeDuration }}. Check whether the model is being preempted or whether the queue is saturated."
+
+    # =========================================================================
+    # Queue alerts — trigger autoscaling review
+    # =========================================================================
+    - name: vllm.queue
+      rules:
+        - alert: VLLMQueueDepthHigh
+          # Waiting requests per engine > 20 for 3 minutes. HPA should be handling
+          # this — if this fires, check whether HPA is blocked or maxReplicas is too low.
+          expr: |
+            avg(vllm:num_requests_waiting) by (namespace) > 20
+          for: 3m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "vLLM request queue is deep"
+            description: "Average {{ $value }} requests are waiting per engine. HPA should scale up — check if maxReplicas is too low or GPU node capacity is exhausted."
+
+    # =========================================================================
+    # GPU memory alerts — catch OOM before it happens
+    # =========================================================================
+    - name: vllm.gpu_memory
+      rules:
+        - alert: VLLMKVCacheNearFull
+          # KV cache > 90% — vLLM will start preempting requests soon.
+          expr: |
+            avg(vllm:gpu_cache_usage_perc) by (pod) > 0.90
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "vLLM KV cache utilization > 90%"
+            description: "Pod {{ $labels.pod }} KV cache is at {{ $value | humanizePercentage }}. vLLM will begin preempting requests at 95%+. Consider reducing max-num-seqs or adding GPU capacity."
+
+        - alert: VLLMPreemptionsIncreasing
+          # vLLM is actively evicting and recomputing requests.
+          expr: |
+            rate(vllm:num_preemption_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "vLLM is preempting requests"
+            description: "vLLM is evicting active requests from GPU memory and recomputing them from scratch. Each preemption adds latency for affected users. KV cache is overcommitted."
+
+        - alert: GPUMemoryHigh
+          # NVIDIA DCGM: GPU memory usage > 95% of total memory.
+          expr: |
+            (DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)) > 0.95
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "GPU memory usage > 95% on {{ $labels.instance }}"
+            description: "GPU {{ $labels.gpu }} on node {{ $labels.instance }} is at {{ $value | humanizePercentage }} memory usage. OOM kill imminent."
+
+    # =========================================================================
+    # GPU health alerts
+    # =========================================================================
+    - name: vllm.gpu_health
+      rules:
+        - alert: GPUTemperatureHigh
+          # GPU temperature > 85°C — thermal throttling risk.
+          expr: |
+            DCGM_FI_DEV_GPU_TEMP > 85
+          for: 5m
+          labels:
+            severity: warning
+            team: infra
+          annotations:
+            summary: "GPU temperature > 85°C on {{ $labels.instance }}"
+            description: "GPU {{ $labels.gpu }} is at {{ $value }}°C. Check datacenter cooling. Thermal throttling will reduce throughput."
+
+        - alert: GPUUtilizationLow
+          # GPU utilization < 10% for > 30 minutes during business hours.
+          # Could indicate a stuck pod, misconfiguration, or wasted spend.
+          expr: |
+            DCGM_FI_DEV_GPU_UTIL < 10
+          for: 30m
+          labels:
+            severity: info
+            team: platform
+          annotations:
+            summary: "GPU utilization < 10% — possible idle GPU"
+            description: "GPU {{ $labels.gpu }} has been under 10% utilization for 30 minutes. Verify vLLM is receiving traffic and the engine pod is healthy."
+
+    # =========================================================================
+    # HPA alerts — catch scaling failures
+    # =========================================================================
+    - name: vllm.hpa
+      rules:
+        - alert: HPAAtMaxReplicas
+          # HPA has been at maxReplicas for > 10 minutes — needs capacity review.
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas{namespace="llm-inference"}
+            ==
+            kube_horizontalpodautoscaler_spec_max_replicas{namespace="llm-inference"}
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "vLLM HPA at maxReplicas for 10+ minutes"
+            description: "The HPA has been saturated at {{ $value }} replicas for 10+ minutes. Increase maxReplicas or add GPU node capacity to handle current traffic."
+
+        - alert: HPAScalingFailed
+          # HPA cannot scale — usually blocked by pod scheduling failure.
+          expr: |
+            kube_horizontalpodautoscaler_status_condition{namespace="llm-inference", condition="ScalingActive", status="false"} == 1
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "vLLM HPA scaling is blocked"
+            description: "The HPA cannot scale the engine deployment. Check for: insufficient GPU node capacity, resource quota limits, or pod scheduling failures (kubectl describe hpa -n llm-inference)."

@@ -1,0 +1,203 @@
+# .github/workflows/deploy.yaml
+# Deployment pipeline:
+#   Push to main     → auto-deploy to staging
+#   Manual approval  → deploy to production
+#
+# Required secrets:
+#   KUBECONFIG_STAGING   — base64-encoded kubeconfig for staging cluster
+#   KUBECONFIG_PROD      — base64-encoded kubeconfig for prod cluster
+#   HF_TOKEN             — HuggingFace API token
+#   SLACK_WEBHOOK        — Slack webhook for deploy notifications
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [staging, prod]
+      version:
+        description: "vLLM image tag to deploy (leave empty for values.yaml default)"
+        required: false
+        default: ""
+
+env:
+  HELM_CHART: helm/vllm-stack
+  RELEASE_NAME: vllm-stack
+  NAMESPACE: llm-inference
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Run CI checks before any deploy
+  # ---------------------------------------------------------------------------
+  ci-check:
+    uses: ./.github/workflows/ci.yaml
+
+  # ---------------------------------------------------------------------------
+  # Deploy to staging (auto on push to main)
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: ci-check
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment:
+      name: staging
+      url: https://api.staging.yourdomain.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.0"
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Ensure namespace exists
+        run: |
+          kubectl get namespace ${{ env.NAMESPACE }} 2>/dev/null \
+            || kubectl create namespace ${{ env.NAMESPACE }}
+
+      - name: Create/update HF token secret
+        run: |
+          kubectl create secret generic hf-secret \
+            --from-literal=token=${{ secrets.HF_TOKEN }} \
+            -n ${{ env.NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Add Helm repos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Build chart dependencies
+        run: helm dependency build ${{ env.HELM_CHART }}/
+
+      - name: Deploy to staging
+        run: |
+          EXTRA_ARGS=""
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            EXTRA_ARGS="--set engine.image.tag=${{ github.event.inputs.version }}"
+          fi
+
+          helm upgrade --install ${{ env.RELEASE_NAME }} ${{ env.HELM_CHART }} \
+            -f environments/staging/values.yaml \
+            --namespace ${{ env.NAMESPACE }} \
+            --create-namespace \
+            --atomic \
+            --timeout 15m \
+            --set global.environment=staging \
+            --set global.gitSha=${{ github.sha }} \
+            $EXTRA_ARGS
+
+      - name: Run smoke tests
+        run: bash scripts/smoke-test.sh staging
+
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} *Staging deploy ${{ job.status }}* | `${{ github.sha }}` | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ---------------------------------------------------------------------------
+  # Deploy to production (manual approval required)
+  # ---------------------------------------------------------------------------
+  deploy-prod:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod'
+    environment:
+      name: production
+      url: https://api.yourdomain.com
+    # GitHub Environment protection rules enforce required reviewers here.
+    # Configure in: Settings → Environments → production → Required reviewers
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.0"
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Verify current state before deploy
+        run: |
+          echo "Current production deployment:"
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app.kubernetes.io/component=engine
+          echo ""
+          echo "Current HPA state:"
+          kubectl get hpa -n ${{ env.NAMESPACE }}
+
+      - name: Create/update HF token secret
+        run: |
+          kubectl create secret generic hf-secret \
+            --from-literal=token=${{ secrets.HF_TOKEN }} \
+            -n ${{ env.NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Add Helm repos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Build chart dependencies
+        run: helm dependency build ${{ env.HELM_CHART }}/
+
+      - name: Deploy to production
+        run: |
+          EXTRA_ARGS=""
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            EXTRA_ARGS="--set engine.image.tag=${{ github.event.inputs.version }}"
+          fi
+
+          helm upgrade --install ${{ env.RELEASE_NAME }} ${{ env.HELM_CHART }} \
+            -f environments/prod/values.yaml \
+            --namespace ${{ env.NAMESPACE }} \
+            --create-namespace \
+            --atomic \
+            --timeout 20m \
+            --set global.environment=prod \
+            --set global.gitSha=${{ github.sha }} \
+            $EXTRA_ARGS
+
+      - name: Run smoke tests
+        run: bash scripts/smoke-test.sh prod
+
+      - name: Tag successful release
+        run: |
+          git tag "deploy-prod-$(date +%Y%m%d-%H%M%S)"
+          git push origin --tags
+
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '🚀' || '🔥' }} *Production deploy ${{ job.status }}* | `${{ github.sha }}` | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

@@ -1,0 +1,37 @@
+# .gitignore
+
+# Never commit secrets or credentials
+*.env
+*.env.*
+.env.local
+secrets/
+*-secret.yaml
+*-secrets.yaml
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+
+# Helm
+helm/*/charts/
+helm/*/*.lock
+*.tgz
+
+# Generated
+dist/
+build/
+*.out
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Trivy
+trivy-results.sarif

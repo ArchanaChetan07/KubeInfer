@@ -1,0 +1,73 @@
+# environments/dev/values.yaml
+# Dev overrides — fast iteration, minimal resources, relaxed security.
+# DO NOT use these settings in staging or production.
+
+global:
+  environment: dev
+
+model:
+  # Smallest usable model for fast dev iteration (~2 GB, no gated access)
+  name: microsoft/Phi-3-mini-4k-instruct
+  gpuMemoryUtilization: "0.85"
+  maxModelLen: 4096
+  disableLogRequests: false   # Keep logs verbose in dev for debugging
+  enablePrefixCaching: false
+
+engine:
+  replicaCount: 1
+  gpuCount: 1
+  tensorParallelSize: 1
+  resources:
+    requests:
+      cpu: "4"
+      memory: "16Gi"
+    limits:
+      cpu: "8"
+      memory: "32Gi"
+  # Shorter startup timeout in dev (smaller model loads faster)
+  startupProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    failureThreshold: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+
+modelCache:
+  size: 10Gi
+  accessMode: ReadWriteOnce    # RWO is fine for single-replica dev
+
+hpa:
+  enabled: false    # No autoscaling in dev — keep costs down
+
+pdb:
+  enabled: false    # No PDB in dev — allow free draining
+
+service:
+  type: LoadBalancer
+
+ingress:
+  enabled: false
+
+networkPolicy:
+  enabled: false    # Relaxed in dev for easier debugging
+
+router:
+  enabled: false    # No router in dev — hit the engine directly
+
+metallb:
+  enabled: true
+  ipRange: "192.168.1.200-192.168.1.205"
+
+openWebui:
+  enabled: true
+  replicaCount: 1
+
+serviceMonitor:
+  enabled: false    # Enable if you have Prometheus Operator in dev
+
+prometheusAdapter:
+  enabled: false
+
+alerting:
+  enabled: false

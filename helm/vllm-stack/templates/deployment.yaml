@@ -1,0 +1,345 @@
+# helm/vllm-stack/templates/deployment.yaml
+---
+# =============================================================================
+# vLLM Engine Deployment
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-engine
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: engine
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.engine.replicaCount }}
+  # RollingUpdate strategy: always keep at least 1 replica up during deploys.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0       # Never take a replica down before a new one is ready
+      maxSurge: 1             # Spin up 1 extra during the rollout
+  selector:
+    matchLabels:
+      {{- include "vllm-stack.engineSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vllm-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/component: engine
+        # This annotation triggers a pod restart when the model name changes.
+        # Without it, a values change would not restart existing pods.
+        checksum/model: {{ .Values.model.name | sha256sum | trunc 8 | quote }}
+      annotations:
+        # Restart pods when the HF secret changes.
+        {{- with .Values.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vllm-stack.serviceAccountName" . }}
+      automountServiceAccountToken: false
+
+      # Prefer to schedule replicas on different nodes (soft anti-affinity).
+      # Hard rule is enforced via topologySpreadConstraints.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "vllm-stack.engineSelectorLabels" . | nindent 20 }}
+
+      {{- with .Values.engine.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with .Values.engine.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with .Values.engine.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      # Grace period long enough for in-flight requests to complete.
+      # vLLM drains open connections on SIGTERM.
+      terminationGracePeriodSeconds: 120
+
+      # Init container: pre-warm the model cache before the engine starts.
+      # If the model is already downloaded, this exits immediately (~1 s).
+      initContainers:
+        - name: model-cache-check
+          image: busybox:stable
+          command:
+            - sh
+            - -c
+            - |
+              echo "Checking model cache..."
+              if [ -d "/models/models--$(echo {{ .Values.model.name }} | tr '/' '-')" ]; then
+                echo "Model cache found. Skipping download."
+              else
+                echo "Model not yet cached — engine will download on first start."
+              fi
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+
+      containers:
+        - name: vllm-engine
+          image: "{{ .Values.engine.image.repository }}:{{ .Values.engine.image.tag }}"
+          imagePullPolicy: {{ .Values.engine.image.pullPolicy }}
+
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            {{- include "vllm-stack.engineArgs" . | nindent 12 }}
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            - name: HF_HOME
+              value: /models
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.model.hfTokenSecret.name }}
+                  key: {{ .Values.model.hfTokenSecret.key }}
+                  optional: true
+            # Expose the pod name and node for tracing/debugging.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with .Values.engine.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          resources:
+            requests:
+              cpu: {{ .Values.engine.resources.requests.cpu | quote }}
+              memory: {{ .Values.engine.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.engine.resources.limits.cpu | quote }}
+              memory: {{ .Values.engine.resources.limits.memory | quote }}
+              nvidia.com/gpu: {{ .Values.engine.gpuCount | quote }}
+
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+            - name: dshm
+              mountPath: /dev/shm   # Required for CUDA IPC (tensor-parallel)
+
+          {{- with .Values.engine.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          {{- with .Values.engine.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          {{- with .Values.engine.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Cannot use readOnlyRootFilesystem: vLLM writes temp files to /tmp
+            # Workaround: mount an emptyDir at /tmp in production if needed.
+
+          lifecycle:
+            preStop:
+              exec:
+                # Give in-flight requests up to 30 seconds to drain before SIGTERM.
+                command: ["/bin/sh", "-c", "sleep 30"]
+
+      volumes:
+        - name: model-cache
+          {{- if .Values.modelCache.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "vllm-stack.fullname" . }}-model-cache
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        # Shared memory for CUDA IPC (needed for tensor parallelism).
+        # Default /dev/shm is 64 MB — not enough for large models.
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+
+{{- if .Values.router.enabled }}
+---
+# =============================================================================
+# Request Router Deployment
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-router
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+spec:
+  replicas: {{ .Values.router.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "vllm-stack.routerSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vllm-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/component: router
+    spec:
+      serviceAccountName: {{ include "vllm-stack.fullname" . }}-router
+      automountServiceAccountToken: true   # Router needs K8s API to discover backends
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: router
+          image: "{{ .Values.router.image.repository }}:{{ .Values.router.image.tag }}"
+          imagePullPolicy: {{ .Values.router.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: ENGINE_SERVICE
+              value: "{{ include "vllm-stack.fullname" . }}-engine.{{ include "vllm-stack.namespace" . }}.svc.cluster.local:8000"
+            - name: ROUTING_STRATEGY
+              value: {{ .Values.router.strategy | quote }}
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            {{- toYaml .Values.router.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+{{- end }}
+
+{{- if .Values.openWebui.enabled }}
+---
+# =============================================================================
+# Open WebUI Deployment
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-webui
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webui
+spec:
+  replicas: {{ .Values.openWebui.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "vllm-stack.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: webui
+  template:
+    metadata:
+      labels:
+        {{- include "vllm-stack.labels" . | nindent 8 }}
+        app.kubernetes.io/component: webui
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: open-webui
+          image: "{{ .Values.openWebui.image.repository }}:{{ .Values.openWebui.image.tag }}"
+          imagePullPolicy: {{ .Values.openWebui.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Point to the router (internal K8s DNS).
+            - name: OPENAI_API_BASE_URL
+              value: "http://{{ include "vllm-stack.fullname" . }}-router.{{ include "vllm-stack.namespace" . }}.svc.cluster.local:8000/v1"
+            - name: OPENAI_API_KEY
+              value: "not-required"
+            - name: OLLAMA_BASE_URL
+              value: ""
+            - name: DATA_DIR
+              value: /app/backend/data
+          volumeMounts:
+            - name: webui-data
+              mountPath: /app/backend/data
+          resources:
+            {{- toYaml .Values.openWebui.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+      volumes:
+        - name: webui-data
+          persistentVolumeClaim:
+            claimName: {{ include "vllm-stack.fullname" . }}-webui-data
+{{- end }}

@@ -1,0 +1,100 @@
+# helm/vllm-stack/templates/rbac.yaml
+# Least-privilege RBAC for the vLLM engine pods.
+# Engine pods only need to read their own ConfigMaps and Secrets.
+# They do NOT need cluster-admin or default service account tokens.
+{{- if .Values.rbac.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "vllm-stack.serviceAccountName" . }}
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+  {{- with .Values.rbac.serviceAccountAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+# Disable auto-mounting of the default service account token.
+# Pods that don't need to call the K8s API should not have a token.
+automountServiceAccountToken: false
+
+---
+# Role: minimal permissions for the engine to read its own config.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-engine
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  # Required to read the HF token secret at startup.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .Values.model.hfTokenSecret.name }}
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-engine
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "vllm-stack.serviceAccountName" . }}
+    namespace: {{ include "vllm-stack.namespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "vllm-stack.fullname" . }}-engine
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ServiceAccount for the router (separate from engine — different permissions).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-router
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+
+---
+# The router needs to list/watch engine pods to discover backends dynamically.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-router
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "endpoints", "services"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-router
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "vllm-stack.fullname" . }}-router
+    namespace: {{ include "vllm-stack.namespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "vllm-stack.fullname" . }}-router
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

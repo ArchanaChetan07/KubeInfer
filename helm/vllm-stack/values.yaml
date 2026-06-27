@@ -1,0 +1,318 @@
+# helm/vllm-stack/values.yaml
+# Default values — overridden by environments/dev|staging|prod/values.yaml
+# Every field is documented. Search for "⚙️" to find the most common knobs.
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+global:
+  # ⚙️  Your company / product name. Used in labels and annotations.
+  company: yourcompany
+  environment: dev    # dev | staging | prod
+
+# ---------------------------------------------------------------------------
+# Namespace
+# ---------------------------------------------------------------------------
+namespace:
+  name: llm-inference
+  # Pod Security Standards label. Options: privileged | baseline | restricted
+  # Use "baseline" — vLLM needs host device access (GPU), so "restricted" blocks it.
+  podSecurityStandard: baseline
+
+# ---------------------------------------------------------------------------
+# Model configuration
+# ---------------------------------------------------------------------------
+model:
+  # ⚙️  HuggingFace model ID
+  name: meta-llama/Llama-3.1-8B-Instruct
+  # ⚙️  HuggingFace token secret. Create with:
+  #   kubectl create secret generic hf-secret --from-literal=token=hf_xxx -n llm-inference
+  hfTokenSecret:
+    name: hf-secret
+    key: token
+  # Dtype for inference. Options: auto | float16 | bfloat16 | float32
+  # bfloat16 is recommended for A100/H100; float16 for older GPUs.
+  dtype: bfloat16
+  # GPU memory fraction reserved for KV cache (the rest is model weights).
+  # Lower if you hit OOM during warmup. Raise for higher throughput.
+  gpuMemoryUtilization: "0.90"
+  # Max sequence length. Reduce to save KV cache memory.
+  maxModelLen: 8192
+  # Disable verbose request logging in production (reduces log volume).
+  disableLogRequests: true
+  # Enable prefix caching for repeat system prompts (free throughput gain).
+  enablePrefixCaching: true
+
+# ---------------------------------------------------------------------------
+# Inference engine (vLLM)
+# ---------------------------------------------------------------------------
+engine:
+  image:
+    repository: vllm/vllm-openai
+    tag: latest       # Pin to a digest in prod: sha256:abc123...
+    pullPolicy: Always
+
+  # ⚙️  Number of engine replicas. Use ≥ 2 in production for HA.
+  replicaCount: 1
+
+  # ⚙️  GPUs per replica. Set tensor-parallel-size to match.
+  gpuCount: 1
+  tensorParallelSize: 1
+
+  # Resource requests/limits
+  resources:
+    requests:
+      cpu: "8"
+      memory: "32Gi"
+    limits:
+      cpu: "16"
+      memory: "64Gi"
+      # nvidia.com/gpu is set dynamically from gpuCount above
+
+  # Extra vLLM args appended to the command. Add --enable-lora, etc. here.
+  extraArgs: []
+  # Example:
+  # extraArgs:
+  #   - "--enable-lora"
+  #   - "--max-lora-rank=64"
+
+  # Extra environment variables passed to the engine container.
+  extraEnv: []
+  # Example:
+  # extraEnv:
+  #   - name: VLLM_ATTENTION_BACKEND
+  #     value: FLASH_ATTN
+
+  # Tolerate GPU node taints (common in managed K8s clusters).
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+
+  # Schedule engine pods only on GPU nodes.
+  nodeSelector:
+    accelerator: nvidia
+
+  # Spread engine replicas across nodes for HA.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: engine
+
+  # Startup probe gives the model time to download and load.
+  startupProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    failureThreshold: 72   # 72 × 10 s = 12 min max startup
+    periodSeconds: 10
+    timeoutSeconds: 5
+
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 60
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+# ---------------------------------------------------------------------------
+# Model weight cache (PersistentVolumeClaim)
+# ---------------------------------------------------------------------------
+modelCache:
+  enabled: true
+  # ⚙️  Adjust to your model size:
+  #   1B  → 5Gi    7B  → 20Gi    13B → 40Gi
+  #   70B → 150Gi  405B → 900Gi
+  size: 50Gi
+  # ReadWriteMany allows multiple replicas to mount the same PVC,
+  # so HPA scale-out doesn't trigger a re-download.
+  accessMode: ReadWriteMany
+  # Leave empty to use the cluster default StorageClass.
+  # For multi-node: use a shared class (e.g., nfs, cephfs, aws-efs).
+  storageClass: ""
+
+# ---------------------------------------------------------------------------
+# Request router
+# ---------------------------------------------------------------------------
+router:
+  enabled: true
+  image:
+    repository: lmcache/lmstack-router
+    tag: latest
+    pullPolicy: Always
+
+  replicaCount: 1
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+
+  # Routing strategy: "round_robin" | "session" | "least_outstanding"
+  # "session" routes the same session ID to the same backend (better KV cache reuse).
+  strategy: session
+
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilization: 80
+
+# ---------------------------------------------------------------------------
+# Horizontal Pod Autoscaler (engine replicas)
+# Scales on vllm:num_requests_waiting (queue depth), not CPU.
+# ---------------------------------------------------------------------------
+hpa:
+  enabled: true
+  minReplicas: 1    # Override to 2 in prod
+  maxReplicas: 8
+  # Scale up when average waiting requests per engine > this threshold.
+  queueDepthThreshold: "5"
+  behavior:
+    scaleUp:
+      # Aggressive scale-up: GPU pods take minutes to start, react fast.
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      # Slow scale-down: avoid churning expensive GPU nodes.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+
+# ---------------------------------------------------------------------------
+# PodDisruptionBudget — ensures at least 1 engine is always available
+# during node drains and rolling updates.
+# ---------------------------------------------------------------------------
+pdb:
+  enabled: true
+  minAvailable: 1   # Override to 2 in prod when replicaCount >= 3
+
+# ---------------------------------------------------------------------------
+# Service & Ingress
+# ---------------------------------------------------------------------------
+service:
+  type: LoadBalancer    # Use ClusterIP + Ingress for TLS termination
+  port: 8000
+  annotations: {}
+  # Example MetalLB annotation:
+  # annotations:
+  #   metallb.universe.tf/address-pool: vllm-ip-pool
+
+ingress:
+  enabled: false    # Enable in staging/prod
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # Rate limiting: 100 req/min per IP
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: api.yourdomain.com    # ⚙️  Override in environment values
+  tls:
+    enabled: false            # Enable in staging/prod
+    secretName: vllm-tls
+
+# ---------------------------------------------------------------------------
+# NetworkPolicy — restricts ingress/egress to only what's needed.
+# ---------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Allow ingress to the engine only from:
+  #   - The router (same namespace)
+  #   - Prometheus (monitoring namespace)
+  additionalIngressNamespaces: []
+  # Example: allow traffic from an application namespace
+  # additionalIngressNamespaces:
+  #   - my-app-namespace
+
+# ---------------------------------------------------------------------------
+# RBAC
+# ---------------------------------------------------------------------------
+rbac:
+  create: true
+  # ServiceAccount name for the vLLM pods.
+  serviceAccountName: vllm-engine
+  # Additional annotations on the ServiceAccount (e.g., for IRSA / Workload Identity)
+  serviceAccountAnnotations: {}
+  # Example AWS IRSA:
+  # serviceAccountAnnotations:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/vllm-role
+
+# ---------------------------------------------------------------------------
+# Open WebUI (chat interface)
+# ---------------------------------------------------------------------------
+openWebui:
+  enabled: true
+  image:
+    repository: ghcr.io/open-webui/open-webui
+    tag: main
+    pullPolicy: Always
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  storage:
+    size: 10Gi
+    storageClass: ""
+  service:
+    type: LoadBalancer
+    port: 80
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+serviceMonitor:
+  enabled: true
+  namespace: monitoring         # Namespace where Prometheus Operator is installed
+  interval: 15s
+  scrapeTimeout: 10s
+
+prometheusAdapter:
+  enabled: true   # Exposes vllm:num_requests_waiting as a custom K8s metric for HPA
+
+alerting:
+  enabled: true
+  # PrometheusRule namespace (where Prometheus Operator is installed)
+  ruleNamespace: monitoring
+
+# ---------------------------------------------------------------------------
+# MetalLB (bare-metal LoadBalancer)
+# ---------------------------------------------------------------------------
+metallb:
+  enabled: true
+  # ⚙️  Set to a free IP range on your subnet.
+  # Run: ip addr  — pick a range outside your DHCP pool.
+  ipRange: "192.168.1.200-192.168.1.220"
+
+# ---------------------------------------------------------------------------
+# Pod annotations / labels (appended to all pods)
+# ---------------------------------------------------------------------------
+commonLabels: {}
+commonAnnotations: {}

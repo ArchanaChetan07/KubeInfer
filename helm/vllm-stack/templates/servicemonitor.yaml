@@ -1,0 +1,89 @@
+# helm/vllm-stack/templates/servicemonitor.yaml
+# ServiceMonitor — tells Prometheus Operator to scrape vLLM engine pods.
+# Requires kube-prometheus-stack or the Prometheus Operator CRDs to be installed.
+{{- if .Values.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-engine
+  # Install into the monitoring namespace so Prometheus discovers it.
+  namespace: {{ .Values.serviceMonitor.namespace }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+    # Prometheus Operator selector label — must match the Prometheus CR's
+    # serviceMonitorSelector. Default kube-prometheus-stack uses "release: prometheus".
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ include "vllm-stack.namespace" . }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: engine
+      {{- include "vllm-stack.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      # Add pod metadata as labels on every time series.
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+      metricRelabelings:
+        # Drop high-cardinality debug metrics to keep Prometheus storage sane.
+        - sourceLabels: [__name__]
+          regex: "vllm:raw_.*"
+          action: drop
+{{- end }}
+
+# =============================================================================
+# Prometheus Adapter ConfigMap
+# Exposes vllm:num_requests_waiting as a custom K8s metric so the HPA can use it.
+# =============================================================================
+{{- if .Values.prometheusAdapter.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-adapter-config
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    rules:
+      # Expose vllm:num_requests_waiting as a per-pod custom metric.
+      # HPA reads this as: "average waiting requests per engine replica."
+      - seriesQuery: 'vllm:num_requests_waiting{namespace!="",pod!=""}'
+        resources:
+          overrides:
+            namespace:
+              resource: namespace
+            pod:
+              resource: pod
+        name:
+          matches: "vllm:num_requests_waiting"
+          as: "vllm_num_requests_waiting"
+        metricsQuery: 'avg_over_time(vllm:num_requests_waiting{<<.LabelMatchers>>}[2m])'
+        # Using avg_over_time smooths out per-second spikes and prevents
+        # HPA from flapping on burst traffic.
+
+      # Also expose KV cache utilization (useful for dashboards and alerting).
+      - seriesQuery: 'vllm:gpu_cache_usage_perc{namespace!="",pod!=""}'
+        resources:
+          overrides:
+            namespace:
+              resource: namespace
+            pod:
+              resource: pod
+        name:
+          matches: "vllm:gpu_cache_usage_perc"
+          as: "vllm_gpu_cache_usage_perc"
+        metricsQuery: 'avg(vllm:gpu_cache_usage_perc{<<.LabelMatchers>>})'
+{{- end }}

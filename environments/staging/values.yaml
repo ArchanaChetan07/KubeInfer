@@ -1,0 +1,85 @@
+# environments/staging/values.yaml
+# Staging overrides — mirrors production topology but with lower scale.
+# Run staging deploys before every production release.
+# Use the same model as production — staging should catch model-loading issues.
+
+global:
+  environment: staging
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  maxModelLen: 8192
+  disableLogRequests: false   # Keep logging in staging for debugging
+  enablePrefixCaching: true
+
+engine:
+  replicaCount: 2             # HA topology even in staging
+  gpuCount: 1
+  tensorParallelSize: 1
+  resources:
+    requests:
+      cpu: "8"
+      memory: "32Gi"
+    limits:
+      cpu: "16"
+      memory: "64Gi"
+
+modelCache:
+  size: 30Gi
+  accessMode: ReadWriteMany
+  storageClass: ""            # Set to your shared StorageClass on multi-node
+
+hpa:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 4
+  queueDepthThreshold: "5"
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+service:
+  type: LoadBalancer
+
+ingress:
+  enabled: true
+  className: nginx
+  host: api.staging.yourdomain.com
+  tls:
+    enabled: true
+    secretName: vllm-tls-staging
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/limit-rps: "200"
+    cert-manager.io/cluster-issuer: letsencrypt-staging
+
+networkPolicy:
+  enabled: true
+
+router:
+  enabled: true
+  replicaCount: 1
+  strategy: session
+
+metallb:
+  enabled: true
+  ipRange: "192.168.1.210-192.168.1.215"
+
+openWebui:
+  enabled: true
+  replicaCount: 1
+
+serviceMonitor:
+  enabled: true
+  namespace: monitoring
+  interval: 15s
+
+prometheusAdapter:
+  enabled: true
+
+alerting:
+  enabled: true

@@ -1,0 +1,196 @@
+{
+  "title": "vLLM Inference Platform",
+  "uid": "vllm-prod-001",
+  "description": "Production monitoring for vLLM inference on NVIDIA GPUs. Covers latency, throughput, GPU memory, KV cache, queue depth, and autoscaling.",
+  "schemaVersion": 38,
+  "tags": ["vllm", "llm", "gpu", "inference"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "type": "query",
+        "query": "label_values(vllm:num_requests_running, namespace)",
+        "label": "Namespace",
+        "current": { "value": "llm-inference" }
+      },
+      {
+        "name": "pod",
+        "type": "query",
+        "query": "label_values(vllm:num_requests_running{namespace=~\"$namespace\"}, pod)",
+        "label": "Engine Pod",
+        "multi": true,
+        "includeAll": true
+      }
+    ]
+  },
+
+  "panels": [
+
+    { "type": "row", "title": "📊 KEY METRICS", "gridPos": {"x":0,"y":0,"w":24,"h":1} },
+
+    {
+      "type": "stat",
+      "title": "Requests Running",
+      "gridPos": {"x":0,"y":1,"w":4,"h":3},
+      "targets": [{"expr": "sum(vllm:num_requests_running{namespace=~\"$namespace\", pod=~\"$pod\"})", "legendFormat": "running"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color":"green","value":0},{"color":"yellow","value":50},{"color":"red","value":100}]}}}
+    },
+    {
+      "type": "stat",
+      "title": "Requests Waiting",
+      "gridPos": {"x":4,"y":1,"w":4,"h":3},
+      "targets": [{"expr": "sum(vllm:num_requests_waiting{namespace=~\"$namespace\", pod=~\"$pod\"})", "legendFormat": "waiting"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color":"green","value":0},{"color":"yellow","value":10},{"color":"red","value":30}]}}}
+    },
+    {
+      "type": "stat",
+      "title": "Token Throughput",
+      "description": "Generation tokens per second across all engines",
+      "gridPos": {"x":8,"y":1,"w":4,"h":3},
+      "targets": [{"expr": "sum(rate(vllm:generation_tokens_total{namespace=~\"$namespace\", pod=~\"$pod\"}[1m]))", "legendFormat": "tokens/s"}],
+      "fieldConfig": {"defaults": {"unit": "ops", "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color":"red","value":0},{"color":"yellow","value":100},{"color":"green","value":500}]}}}
+    },
+    {
+      "type": "stat",
+      "title": "KV Cache Usage",
+      "gridPos": {"x":12,"y":1,"w":4,"h":3},
+      "targets": [{"expr": "avg(vllm:gpu_cache_usage_perc{namespace=~\"$namespace\", pod=~\"$pod\"}) * 100", "legendFormat": "cache %"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color":"green","value":0},{"color":"yellow","value":75},{"color":"red","value":90}]}}}
+    },
+    {
+      "type": "stat",
+      "title": "Engine Replicas",
+      "gridPos": {"x":16,"y":1,"w":4,"h":3},
+      "targets": [{"expr": "kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=~\".*engine.*\"}", "legendFormat": "ready"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color":"red","value":0},{"color":"yellow","value":1},{"color":"green","value":2}]}}}
+    },
+    {
+      "type": "stat",
+      "title": "GPU Util (avg)",
+      "gridPos": {"x":20,"y":1,"w":4,"h":3},
+      "targets": [{"expr": "avg(DCGM_FI_DEV_GPU_UTIL)", "legendFormat": "gpu %"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color":"green","value":0},{"color":"yellow","value":80},{"color":"red","value":95}]}}}
+    },
+
+    { "type": "row", "title": "⏱ LATENCY", "gridPos": {"x":0,"y":4,"w":24,"h":1} },
+
+    {
+      "type": "timeseries",
+      "title": "Time to First Token (TTFT)",
+      "description": "How long users wait before seeing the first token. Most sensitive latency metric.",
+      "gridPos": {"x":0,"y":5,"w":12,"h":7},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(vllm:time_to_first_token_seconds_bucket{namespace=~\"$namespace\", pod=~\"$pod\"}[2m]))", "legendFormat": "P50"},
+        {"expr": "histogram_quantile(0.95, rate(vllm:time_to_first_token_seconds_bucket{namespace=~\"$namespace\", pod=~\"$pod\"}[2m]))", "legendFormat": "P95"},
+        {"expr": "histogram_quantile(0.99, rate(vllm:time_to_first_token_seconds_bucket{namespace=~\"$namespace\", pod=~\"$pod\"}[2m]))", "legendFormat": "P99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-End Request Latency",
+      "description": "Total request latency from first token to last token.",
+      "gridPos": {"x":12,"y":5,"w":12,"h":7},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(vllm:e2e_request_latency_seconds_bucket{namespace=~\"$namespace\", pod=~\"$pod\"}[2m]))", "legendFormat": "P50"},
+        {"expr": "histogram_quantile(0.95, rate(vllm:e2e_request_latency_seconds_bucket{namespace=~\"$namespace\", pod=~\"$pod\"}[2m]))", "legendFormat": "P95"},
+        {"expr": "histogram_quantile(0.99, rate(vllm:e2e_request_latency_seconds_bucket{namespace=~\"$namespace\", pod=~\"$pod\"}[2m]))", "legendFormat": "P99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+
+    { "type": "row", "title": "🚦 THROUGHPUT & QUEUE", "gridPos": {"x":0,"y":12,"w":24,"h":1} },
+
+    {
+      "type": "timeseries",
+      "title": "Token Throughput",
+      "gridPos": {"x":0,"y":13,"w":12,"h":6},
+      "targets": [
+        {"expr": "sum(rate(vllm:generation_tokens_total{namespace=~\"$namespace\", pod=~\"$pod\"}[1m]))", "legendFormat": "generation tokens/s"},
+        {"expr": "sum(rate(vllm:prompt_tokens_total{namespace=~\"$namespace\", pod=~\"$pod\"}[1m]))", "legendFormat": "prompt tokens/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue Depth (HPA Signal)",
+      "description": "vllm:num_requests_waiting is what the HPA scales on. Watch this to understand autoscaling behavior.",
+      "gridPos": {"x":12,"y":13,"w":12,"h":6},
+      "targets": [
+        {"expr": "sum(vllm:num_requests_running{namespace=~\"$namespace\", pod=~\"$pod\"})", "legendFormat": "running"},
+        {"expr": "sum(vllm:num_requests_waiting{namespace=~\"$namespace\", pod=~\"$pod\"})", "legendFormat": "waiting (HPA signal)"}
+      ]
+    },
+
+    { "type": "row", "title": "🖥 GPU RESOURCES", "gridPos": {"x":0,"y":19,"w":24,"h":1} },
+
+    {
+      "type": "timeseries",
+      "title": "GPU Utilization",
+      "gridPos": {"x":0,"y":20,"w":8,"h":6},
+      "targets": [{"expr": "DCGM_FI_DEV_GPU_UTIL", "legendFormat": "GPU {{gpu}} - {{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100}}
+    },
+    {
+      "type": "timeseries",
+      "title": "GPU Memory Used",
+      "gridPos": {"x":8,"y":20,"w":8,"h":6},
+      "targets": [
+        {"expr": "DCGM_FI_DEV_FB_USED", "legendFormat": "Used - GPU {{gpu}}"},
+        {"expr": "DCGM_FI_DEV_FB_FREE", "legendFormat": "Free - GPU {{gpu}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "decmbytes"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "GPU Temperature",
+      "gridPos": {"x":16,"y":20,"w":8,"h":6},
+      "targets": [{"expr": "DCGM_FI_DEV_GPU_TEMP", "legendFormat": "GPU {{gpu}} - {{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "celsius", "thresholds": {"steps": [{"color":"green","value":0},{"color":"yellow","value":75},{"color":"red","value":85}]}}}
+    },
+
+    { "type": "row", "title": "📦 KV CACHE & PREEMPTIONS", "gridPos": {"x":0,"y":26,"w":24,"h":1} },
+
+    {
+      "type": "timeseries",
+      "title": "KV Cache Utilization",
+      "description": "Above 90% → vLLM starts preempting. Above 95% → significant user-facing latency.",
+      "gridPos": {"x":0,"y":27,"w":12,"h":6},
+      "targets": [{"expr": "vllm:gpu_cache_usage_perc{namespace=~\"$namespace\", pod=~\"$pod\"} * 100", "legendFormat": "{{pod}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min":0,"max":100, "thresholds": {"steps": [{"color":"green","value":0},{"color":"yellow","value":75},{"color":"red","value":90}]}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Preemptions",
+      "description": "Each preemption = a request recomputed from scratch. Sustained preemptions means GPU memory is overcommitted.",
+      "gridPos": {"x":12,"y":27,"w":12,"h":6},
+      "targets": [{"expr": "rate(vllm:num_preemption_total{namespace=~\"$namespace\", pod=~\"$pod\"}[1m])", "legendFormat": "preemptions/s - {{pod}}"}]
+    },
+
+    { "type": "row", "title": "🔄 AUTOSCALING", "gridPos": {"x":0,"y":33,"w":24,"h":1} },
+
+    {
+      "type": "timeseries",
+      "title": "HPA Replica Count",
+      "gridPos": {"x":0,"y":34,"w":12,"h":5},
+      "targets": [
+        {"expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"$namespace\"}", "legendFormat": "current - {{horizontalpodautoscaler}}"},
+        {"expr": "kube_horizontalpodautoscaler_spec_max_replicas{namespace=\"$namespace\"}", "legendFormat": "max"},
+        {"expr": "kube_horizontalpodautoscaler_spec_min_replicas{namespace=\"$namespace\"}", "legendFormat": "min"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pod Readiness",
+      "gridPos": {"x":12,"y":34,"w":12,"h":5},
+      "targets": [
+        {"expr": "kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=~\".*engine.*\"}", "legendFormat": "ready"},
+        {"expr": "kube_deployment_status_replicas{namespace=\"$namespace\", deployment=~\".*engine.*\"}", "legendFormat": "desired"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+apiVersion: v2
+name: vllm-stack
+description: |
+  Production-grade vLLM inference stack for NVIDIA GPUs.
+  Includes request router, queue-depth autoscaling, full observability,
+  RBAC, NetworkPolicy, and multi-environment support.
+type: application
+version: 1.0.0
+appVersion: "0.6.6"   # vLLM version
+
+keywords:
+  - vllm
+  - llm
+  - inference
+  - nvidia
+  - gpu
+  - ai
+
+maintainers:
+  - name: Platform Team
+    email: platform@yourcompany.com
+
+dependencies:
+  # Prometheus Adapter — exposes custom metrics (queue depth) to HPA
+  - name: prometheus-adapter
+    version: "4.10.0"
+    repository: "https://prometheus-community.github.io/helm-charts"
+    condition: prometheusAdapter.enabled
+
+annotations:
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial production release

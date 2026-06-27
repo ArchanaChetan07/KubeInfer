@@ -1,0 +1,30 @@
+# helm/vllm-stack/templates/metallb.yaml
+# MetalLB IP address pool — used when running on bare metal without a cloud LB.
+# Skip this if you're on EKS/GKE/AKS (cloud LBs are provisioned automatically).
+{{- if .Values.metallb.enabled }}
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-pool
+  namespace: metallb-system
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  addresses:
+    # ⚙️  Set to a free IP range on your subnet (outside DHCP pool).
+    # Run: ip addr  — find your interface subnet, pick a free range.
+    - {{ .Values.metallb.ipRange }}
+
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-l2
+  namespace: metallb-system
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+spec:
+  ipAddressPools:
+    - {{ include "vllm-stack.fullname" . }}-pool
+{{- end }}

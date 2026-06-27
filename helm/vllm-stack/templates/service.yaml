@@ -1,0 +1,111 @@
+# helm/vllm-stack/templates/service.yaml
+---
+# Engine service (internal only — not exposed externally).
+# The router is the public-facing entry point.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-engine
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: engine
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  clusterIP: None   # Headless service: router discovers individual pod IPs directly
+  selector:
+    {{- include "vllm-stack.engineSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8000
+      targetPort: http
+
+{{- if .Values.router.enabled }}
+---
+# Router service — this is the external entry point for all API traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-router
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "vllm-stack.routerSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.service.port }}
+      targetPort: http
+  # If type=LoadBalancer, preserve source IPs for rate-limiting / audit logs.
+  {{- if eq .Values.service.type "LoadBalancer" }}
+  externalTrafficPolicy: Local
+  {{- end }}
+{{- end }}
+
+{{- if .Values.openWebui.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}-webui
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webui
+spec:
+  type: {{ .Values.openWebui.service.type }}
+  selector:
+    {{- include "vllm-stack.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: webui
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.openWebui.service.port }}
+      targetPort: 8080
+{{- end }}
+
+# helm/vllm-stack/templates/ingress.yaml
+{{- if .Values.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "vllm-stack.fullname" . }}
+  namespace: {{ include "vllm-stack.namespace" . }}
+  labels:
+    {{- include "vllm-stack.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.ingress.annotations | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "vllm-stack.fullname" . }}-router
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}
