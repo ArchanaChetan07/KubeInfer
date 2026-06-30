@@ -38,7 +38,7 @@ Internet / Internal Clients
                 │
 ┌───────────────▼─────────────────┐
 │       Request Router            │  Session-affinity routing
-│       HPA: CPU-based 1–10x      │  → KV cache reuse
+│       HPA: queue-depth based    │  → KV cache reuse
 └──────┬────────┬────────┬────────┘
        │        │        │
   ┌────▼──┐ ┌──▼───┐ ┌──▼───┐
@@ -62,7 +62,7 @@ Scale down: 10 min stabilization → -1 pod/5 min
 ## Key design decisions
 
 **Queue-depth HPA, not CPU HPA**
-LLM inference is GPU-bound. CPU sits at 5% while the GPU queue fills up. Scaling on CPU tells you nothing. We expose `vllm:num_requests_waiting` via Prometheus Adapter as a custom K8s metric and scale on that instead.
+LLM inference is GPU-bound. CPU sits at 5% while the GPU queue fills up. Scaling on CPU tells you nothing. KubeInfer exposes `vllm:num_requests_waiting` via Prometheus Adapter as a custom K8s metric and scales on that instead.
 
 **Asymmetric scale behavior**
 Scale up fast (2 pods/60s) — GPU pods take 2–5 min to become ready, so react before users notice. Scale down slow (1 pod/5 min, 10 min stabilization) — avoid churning expensive GPU nodes on transient dips.
@@ -224,6 +224,18 @@ Manual trigger (prod)
 
 ---
 
+## Part of the vLLM Observability Ecosystem
+
+| Project | What it does |
+|---------|-------------|
+| **[KubeInfer](https://github.com/ArchanaChetan07/KubeInfer)** ← you are here | Production K8s deployment · queue-depth HPA · GitOps · 12 alert rules |
+| **[AI Inference Observability Platform](https://github.com/ArchanaChetan07/ai-inference-observability-platform)** | FastAPI proxy · TTFT/TBT/E2E · Prometheus · Grafana · OpenTelemetry |
+| **[KV Cache Profiler](https://github.com/ArchanaChetan07/KV-Cache-Profiler-)** | Real-time GPU KV cache hit rate · eviction · memory pressure |
+| **[LLM Benchmarking Dashboard](https://github.com/ArchanaChetan07/LLM-Inference-Benchmarking-Dashboard)** | Live TTFT/TPOT/ITL/E2EL charts · DCGM GPU metrics |
+| **[AI Infrastructure Copilot](https://github.com/ArchanaChetan07/AI-Infrastructure-Copilot)** | Conversational assistant for GPU capacity planning and K8s config |
+
+---
+
 ## Docs
 
 - [Architecture deep-dive](docs/architecture.md)
@@ -232,9 +244,17 @@ Manual trigger (prod)
 
 ---
 
-## Author
+## License
 
-**Archana Suresh Patil** — Platform & MLOps Engineer  
-MS Data Science · University of San Diego · GPA 3.9  
-📍 Sunnyvale, CA · Open to full-time · No sponsorship needed  
-📬 apatil@sandiego.edu · [LinkedIn](https://linkedin.com/in/archana-suresh-patil-792213245) · [GitHub](https://github.com/ArchanaChetan07)
+[MIT](LICENSE)
+
+---
+
+<div align="center">
+
+**Archana Suresh Patil** — ML Platform & MLOps Engineer · Sunnyvale, CA  
+[LinkedIn](https://linkedin.com/in/archana-suresh-patil-792213245) · [GitHub](https://github.com/ArchanaChetan07) · Open to full-time · No sponsorship needed
+
+**[⭐ Star this repo](https://github.com/ArchanaChetan07/KubeInfer)** if it helps your LLM serving platform.
+
+</div>
