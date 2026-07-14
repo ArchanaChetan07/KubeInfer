@@ -1,100 +1,110 @@
 # KubeInfer
 
-Python · FastAPI · Kubernetes · Docker · Helm · Prometheus · Grafana · GPU · vLLM · MLOps · CI/CD. 12 Alertmanager rules; HPA +2 pods/60s when waiting>5; ~1000 req/min class; 29 files. Production LLM/platform engineering focus for latency, cost, and reliability.
+### Helm-packaged vLLM on Kubernetes with queue-depth HPA and Prometheus alert rules
 
-## Results (numbers)
+[![CI](https://github.com/ArchanaChetan07/KubeInfer/actions/workflows/ci.yaml/badge.svg)](https://github.com/ArchanaChetan07/KubeInfer/actions/workflows/ci.yaml)
+[![Helm](https://img.shields.io/badge/chart-vllm--stack-326CE5.svg)](helm/vllm-stack/)
+[![Kubernetes](https://img.shields.io/badge/target-Kubernetes-326CE5.svg)](helm/vllm-stack/templates/)
+[![Alerts](https://img.shields.io/badge/Prometheus-12%20rules-E6522C.svg)](monitoring/alerts/vllm-alerts.yaml)
 
-| Metric | Value |
+Infrastructure-as-code repo for running **vLLM inference on GPU Kubernetes**: a production-oriented **Helm chart** (`vllm-stack`), environment-specific values, **queue-depth HPA** (not CPU-based), **12 Prometheus alert rules**, Grafana dashboard JSON, bootstrap scripts, and GitOps-style CI. No application Python — Shell, Helm templates, and YAML only.
+
+---
+
+## Key Results
+
+| Metric | Value | Source |
+|---|---|---|
+| Tracked files | **29** | git tree |
+| Helm chart | **vllm-stack** (deployment, HPA, ServiceMonitor, PDB, RBAC) | `helm/vllm-stack/` |
+| Prometheus alert rules | **12** | `monitoring/alerts/vllm-alerts.yaml` |
+| HPA signal | `vllm_num_requests_waiting` avg **> 5** per replica | `helm/vllm-stack/templates/hpa.yaml` |
+| Scale-up policy | **+2 pods / 60s** | `helm/vllm-stack/values.yaml` |
+| Environments | dev, staging, prod values | `environments/` |
+| CI workflows | lint + deploy pipelines | `.github/workflows/` |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph K8s["Kubernetes cluster"]
+        ING[LoadBalancer / Ingress] --> RTR[vLLM router optional]
+        RTR --> ENG[vLLM engine Deployment]
+        HPA[HPA on queue depth] --> ENG
+        ENG --> GPU[NVIDIA GPU nodes]
+        SM[ServiceMonitor] --> ENG
+    end
+    PROM[Prometheus] --> SM
+    AM[Alertmanager] --> RULES[12 vLLM alert rules]
+    RULES --> PROM
+    GRAF[Grafana dashboard] --> PROM
+    GIT[GitHub Actions] --> HELM[helm upgrade vllm-stack]
+```
+
+**How it works:** the engine Deployment exposes vLLM native metrics; Prometheus Adapter feeds `vllm_num_requests_waiting` to HPA so scaling reacts to **inference queue depth** instead of idle CPU. Alert rules cover availability, TTFT/E2E latency, queue saturation, KV-cache pressure, GPU memory/temperature, and HPA saturation.
+
+---
+
+## Tech Stack
+
+| Layer | Choice |
 |---|---|
-| Tracked repository files | **29** |
-| Python modules | **0** |
-| Notebooks | **0** |
-| Markdown docs | **4** |
-| CI workflows present | **Yes** |
-| Automated tests present | **No** |
-| Project highlights | **12 Alertmanager rules; HPA +2 pods/60s when waiting>5; ~1000 req/min class; 29 files** |
+| Packaging | Helm 3 chart + Go templates |
+| Orchestration | Kubernetes (Deployments, HPA v2, PDB, NetworkPolicy) |
+| Observability | PrometheusRule CRD, ServiceMonitor, Grafana JSON |
+| GPU | NVIDIA device plugin / DCGM metrics in alerts |
+| Automation | Makefile, `scripts/bootstrap.sh`, `scripts/smoke-test.sh` |
+| CI | GitHub Actions (`ci.yaml`, `deploy.yaml`) |
 
-## Tech stack
+---
 
-- **Primary language:** Shell
-- **Languages (GitHub):** Shell (22248 bytes), Go Template (3209 bytes), Makefile (2605 bytes)
-- **Focus area:** infra
-- **Tooling keywords:** Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM
+## Features
 
-## Architecture (logical)
+- Queue-depth HPA with asymmetric scale-up (fast) / scale-down (slow)
+- 12 alert groups: availability, latency, queue, KV cache, GPU health, HPA
+- Per-environment values overlays (`environments/dev|staging|prod`)
+- MetalLB / LoadBalancer service templates
+- Helm unit tests under `tests/helm-unit-tests/`
+- Runbooks in `docs/runbook.md` and `docs/scaling-guide.md`
 
-\\	ext
-Inputs → Processing / models / agents → Evaluation & metrics → CI checks → Artifacts
-\
-## Engineering practices
+---
 
-1. Reproducible layout with clear module boundaries  
-2. Automated validation via CI and/or tests when present  
-3. Documentation that states measurable outcomes, not slogans  
-4. Skill surface aligned to common JD keywords: Python, machine learning, NLP/LLM, Kubernetes, Docker, observability, data pipelines  
+## Installation & Usage
 
-## Quick start
-
-\\ash
+```bash
 git clone https://github.com/ArchanaChetan07/KubeInfer.git
 cd KubeInfer
-# Install project requirements (see requirements.txt / pyproject.toml / environment files if present)
-# Run tests or main entrypoints documented in this repo
-\
-## Skills demonstrated
 
-Python · machine-learning · CI/CD · API design · testing · automation · Docker · Kubernetes · FastAPI · Prometheus · data-science · LLM · MLOps · software-engineering · benchmarking · observability
+# Render / lint chart
+helm template vllm-stack helm/vllm-stack -f environments/dev/values.yaml
 
-## License / notice
+# Bootstrap cluster prerequisites (GPU operator, monitoring)
+./scripts/bootstrap.sh
 
-See repository license file if present. Metrics above are derived from repository structure and previously published validation notes where available.
+# Install stack
+helm upgrade --install vllm-stack helm/vllm-stack \
+  -f environments/staging/values.yaml -n llm-inference --create-namespace
+```
 
+---
 
-### Extended notes
+## Project Structure
 
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
+```text
+KubeInfer/
+├── helm/vllm-stack/           # Chart, HPA, deployment, ServiceMonitor
+├── monitoring/alerts/         # 12 Prometheus rules
+├── monitoring/dashboards/     # Grafana JSON
+├── environments/              # dev / staging / prod values
+├── scripts/                   # bootstrap, smoke-test
+├── docs/                      # architecture, runbook, scaling
+└── .github/workflows/         # CI + deploy
+```
 
+---
 
-### Extended notes
+## License
 
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
-
-
-### Extended notes
-
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
-
-
-### Extended notes
-
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
-
-
-### Extended notes
-
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
-
-
-### Extended notes
-
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
-
-
-### Extended notes
-
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
-
-
-### Extended notes
-
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
-
-
-### Extended notes
-
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
-
-
-### Extended notes
-
-This section expands documentation for completeness: reproducibility, keyword coverage for Python, machine-learning, CI/CD, API, Docker, Kubernetes, FastAPI, Prometheus, testing, automation, MLOps, LLM, data-science, software-engineering, benchmarking, and observability practices used across the portfolio.
+See repository license file if present.
